@@ -1,14 +1,78 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-// Public project URL + publishable/anon key belong here after configuration.
-// Never put a service_role key in frontend code.
 import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
-const $=id=>document.getElementById(id); const fmt=n=>Number(n||0).toLocaleString('en-US',{maximumFractionDigits:2});
-let sb=null, all=[];
-const show=(text,error=false)=>{const el=$('message');el.style.display='block';el.textContent=text;el.className=error?'bad':'good'};
-function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function masked(v){const x=String(v??'');return x.length>5?x.slice(0,3)+'•••••'+x.slice(-2):'••••••'}
-function filtered(){let cat=$('category').value,elig=$('eligibility').value;return all.filter(r=>(cat==='ALL'||r.campaign_category===cat)&&(elig==='ALL'||r.eligibility_status===elig))}
-function paint(){const list=filtered().slice().sort((a,b)=>Number(b.achievement_percentage||0)-Number(a.achievement_percentage||0)||Number(b.achievement||0)-Number(a.achievement||0));$('results').innerHTML=list.slice(0,500).map((r,i)=>`<tr><td>${i+1}</td><td>${esc(r.agent_name||r.agent_shop_name||'Agent')}<div class="muted">${masked(r.agent_wallet)}</div></td><td><span class="badge">${esc(r.campaign_category)}</span></td><td>${esc(r.distribution_house||'—')}</td><td class="num">${fmt(r.achievement)}</td><td class="num">${fmt(r.fixed_target)}</td><td class="num">${fmt(r.achievement_percentage)}%</td><td>${r.eligibility_status==='ELIGIBLE'?'<span class="good">Eligible</span>':'<span class="bad">Not eligible</span>'}</td></tr>`).join('')||'<tr><td colspan="8">No matching agents.</td></tr>';$('rowSummary').textContent=`Showing ${Math.min(list.length,500).toLocaleString()} of ${list.length.toLocaleString()} records. Maximum 500 rows displayed.`}
-async function load(){if(!SUPABASE_URL||!SUPABASE_ANON_KEY||SUPABASE_URL.includes('YOUR_')){show('Setup needed: add your Supabase Project URL and publishable (anon) key to config.js after configuring the approved public view.',true);$('results').innerHTML='<tr><td colspan="8">Supabase is not configured yet.</td></tr>';return}
-try{if(!sb)sb=createClient(SUPABASE_URL,SUPABASE_ANON_KEY);let {data,error}=await sb.from('public_campaign_results').select('report_date,wallet_suffix,agent_name,agent_shop_name,campaign_category,distribution_house,fixed_target,achievement,total_mtd_count,achievement_percentage,remaining_target,eligibility_status').order('achievement_percentage',{ascending:false}).limit(5000);if(error)throw error;all=data||[];let date=all.map(x=>x.report_date).filter(Boolean).sort().at(-1);$('reportDate').textContent=date||'No report';$('campaignCount').textContent=fmt(all.length);$('eligibleCount').textContent=fmt(all.filter(x=>x.eligibility_status==='ELIGIBLE').length);$('notEligibleCount').textContent=fmt(all.filter(x=>x.eligibility_status==='NOT_ELIGIBLE').length);let avg=all.length?all.reduce((s,x)=>s+Number(x.achievement_percentage||0),0)/all.length:0;$('avgAchievement').textContent=fmt(avg)+'%';paint();if(date)show('Latest report loaded: '+date)}catch(e){console.error(e);show('Data load failed. Check the approved public view, RLS grants, and Supabase configuration.',true);$('results').innerHTML='<tr><td colspan="8">Could not load campaign data.</td></tr>'}}
-$('refresh').onclick=load;$('category').onchange=paint;$('eligibility').onchange=paint;$('searchForm').addEventListener('submit',e=>{e.preventDefault();$('searchResult').innerHTML='<p class="muted">Exact wallet lookup is temporarily disabled to prevent incorrect matches. It will be enabled after a protected authenticated lookup function is deployed.</p>'});load();
+
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n ?? 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
+let sb = null, all = [], offset = 0, loading = false, hasMore = true;
+const PAGE_SIZE = 500;
+
+const show = (message, error = false) => {
+  const el = $('message');
+  el.style.display = 'block';
+  el.textContent = message;
+  el.className = error ? 'bad' : 'good';
+};
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+function filtered() {
+  const category = $('category').value;
+  return all.filter(r => category === 'ALL' || r.campaign_category === category);
+}
+function paint() {
+  const rows = filtered();
+  $('results').innerHTML = rows.map(r => `
+    <tr><td>${r.category_rank == null ? '—' : fmt(r.category_rank)}</td>
+    <td>${esc(r.agent_name || 'Agent')}</td>
+    <td><span class="badge">${esc(r.campaign_category || '—')}</span></td>
+    <td class="num">${fmt(r.achievement)}</td>
+    <td class="num">${fmt(r.fixed_target)}</td>
+    <td class="num">${fmt(r.achievement_percentage)}%</td></tr>`).join('') ||
+    '<tr><td colspan="6">No matching agents.</td></tr>';
+  $('rowSummary').textContent = `Showing ${fmt(rows.length)} of ${fmt(all.length)} loaded records.`;
+  $('loadMore').hidden = !hasMore;
+  $('loadMore').disabled = loading || !hasMore;
+  $('loadMore').textContent = loading ? 'Loading…' : hasMore ? 'Load more agents' : 'All available records loaded';
+  $('campaignCount').textContent = fmt(all.length);
+  $('categoryCount').textContent = fmt(new Set(all.map(r => r.campaign_category).filter(Boolean)).size);
+  $('topAchievement').textContent = fmt(all.reduce((m, r) => Math.max(m, Number(r.achievement_percentage || 0)), 0)) + '%';
+}
+async function loadNextPage(reset = false) {
+  if (loading) return;
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY || SUPABASE_URL.includes('YOUR_') || SUPABASE_ANON_KEY.includes('YOUR_')) {
+    show('Setup needed: add your Supabase Project URL and publishable/anon key to config.js. Never use a service_role or secret key in frontend code.', true);
+    $('results').innerHTML = '<tr><td colspan="6">Supabase is not configured yet.</td></tr>';
+    $('loadMore').hidden = true;
+    return;
+  }
+  if (reset) { all = []; offset = 0; hasMore = true; }
+  if (!hasMore) return;
+  loading = true;
+  $('loadMore').disabled = true;
+  $('loadMore').textContent = 'Loading…';
+  try {
+    if (!sb) sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    const { data, error } = await sb.rpc('get_public_campaign_leaderboard', { p_limit: PAGE_SIZE, p_offset: offset });
+    if (error) throw error;
+    const page = data || [];
+    all = all.concat(page);
+    offset += page.length;
+    hasMore = page.length === PAGE_SIZE;
+    $('reportDate').textContent = 'Latest campaign view';
+    paint();
+    show(page.length ? 'Campaign results loaded.' : (all.length ? 'All available results loaded.' : 'No campaign results were returned.'));
+  } catch (err) {
+    console.error(err);
+    show('Data load failed. Check Supabase URL/key, function permissions, and GitHub Pages deployment.', true);
+    if (!all.length) $('results').innerHTML = '<tr><td colspan="6">Could not load campaign data.</td></tr>';
+  } finally {
+    loading = false;
+    paint();
+  }
+}
+$('refresh').addEventListener('click', () => loadNextPage(true));
+$('loadMore').addEventListener('click', () => loadNextPage(false));
+$('category').addEventListener('change', paint);
+loadNextPage(true);
